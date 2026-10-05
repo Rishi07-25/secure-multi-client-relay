@@ -1,24 +1,15 @@
-# Secrets and local configuration
-config/shared.key
-*.key
-.env
-.env.*
-!.env.example
+build/*
+!build/.gitkeep
 
-# Python
-__pycache__/
-*.py[cod]
+frontend/venv/
 .venv/
 venv/
-frontend/venv/
+__pycache__/
+*.py[cod]
 
-# C build output and generated binaries
-build/
-*.o
-*.a
-*.so
+config/shared.key
 
-# Editor and OS files
+*.log
 .DS_Store
-.idea/
 .vscode/
+.idea/

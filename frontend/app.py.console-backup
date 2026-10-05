@@ -1,0 +1,1875 @@
+import streamlit as st
+import socket
+import struct
+import threading
+import queue
+import time
+from pathlib import Path
+
+from nacl.bindings import (
+    crypto_aead_xchacha20poly1305_ietf_encrypt,
+    crypto_aead_xchacha20poly1305_ietf_decrypt,
+)
+
+
+# ============================================================
+# PROJECT CONFIGURATION
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_SERVER_HOST = "192.168.2.2"
+DEFAULT_SERVER_PORT = 9090
+DEFAULT_KEY_PATH = PROJECT_ROOT / "config" / "shared.key"
+
+PROTOCOL_VERSION = 1
+
+PROTOCOL_TYPE_CLIENT_ID = 1
+PROTOCOL_TYPE_MESSAGE = 2
+
+BROADCAST_ID = 0
+
+PROTOCOL_HEADER_SIZE = 46
+
+CRYPTO_KEY_SIZE = 32
+CRYPTO_NONCE_SIZE = 24
+CRYPTO_MAC_SIZE = 16
+
+PROTOCOL_MAX_PAYLOAD = 4096
+
+
+# ============================================================
+# PROTOCOL HELPERS
+# ============================================================
+
+def load_key(path):
+    """
+    Load the same 64-hex-character key format used by the
+    C key manager.
+    """
+    path = Path(path)
+
+    with open(path, "r", encoding="ascii") as f:
+        raw = f.read(64)
+
+    raw = raw.strip()
+
+    if len(raw) != 64:
+        raise ValueError(
+            f"Invalid key length: expected 64 hex characters, "
+            f"got {len(raw)}"
+        )
+
+    try:
+        key = bytes.fromhex(raw)
+    except ValueError as exc:
+        raise ValueError("Key contains invalid hexadecimal characters") from exc
+
+    if len(key) != CRYPTO_KEY_SIZE:
+        raise ValueError(
+            f"Invalid key length: expected {CRYPTO_KEY_SIZE} bytes, "
+            f"got {len(key)}"
+        )
+
+    return key
+
+
+def build_aad(header):
+    """
+    The C protocol authenticates:
+
+        header bytes 0..21
+        +
+        header bytes 42..45
+
+    Total AAD = 26 bytes.
+    """
+    if len(header) < PROTOCOL_HEADER_SIZE:
+        raise ValueError("Header too short")
+
+    return header[0:22] + header[42:46]
+
+
+def build_message_frame(
+    key,
+    sender_id,
+    target_id,
+    sequence,
+    plaintext,
+):
+    """
+    Build the exact 46-byte-header relay protocol frame.
+    """
+
+    if len(plaintext) > PROTOCOL_MAX_PAYLOAD:
+        raise ValueError("Payload exceeds protocol maximum")
+
+    nonce = __import__("secrets").token_bytes(CRYPTO_NONCE_SIZE)
+
+    # Header without nonce.
+    header = bytearray(PROTOCOL_HEADER_SIZE)
+
+    header[0] = PROTOCOL_VERSION
+    header[1] = PROTOCOL_TYPE_MESSAGE
+
+    struct.pack_into(
+        "!I",
+        header,
+        2,
+        sender_id,
+    )
+
+    struct.pack_into(
+        "!I",
+        header,
+        6,
+        target_id,
+    )
+
+    struct.pack_into(
+        "!Q",
+        header,
+        10,
+        sequence,
+    )
+
+    # Ciphertext length includes the 16-byte authentication tag.
+    ciphertext_length = len(plaintext) + CRYPTO_MAC_SIZE
+
+    struct.pack_into(
+        "!I",
+        header,
+        18,
+        ciphertext_length,
+    )
+
+    header[22:46] = nonce
+
+    aad = build_aad(header)
+
+    ciphertext = crypto_aead_xchacha20poly1305_ietf_encrypt(
+        plaintext,
+        aad,
+        nonce,
+        key,
+    )
+
+    return bytes(header) + ciphertext
+
+
+def parse_frame(frame):
+    """
+    Parse a complete protocol frame.
+    """
+
+    if len(frame) < PROTOCOL_HEADER_SIZE:
+        raise ValueError("Frame too short")
+
+    version = frame[0]
+    frame_type = frame[1]
+
+    if version != PROTOCOL_VERSION:
+        raise ValueError(
+            f"Unsupported protocol version: {version}"
+        )
+
+    sender_id = struct.unpack_from("!I", frame, 2)[0]
+    target_id = struct.unpack_from("!I", frame, 6)[0]
+    sequence = struct.unpack_from("!Q", frame, 10)[0]
+    ciphertext_length = struct.unpack_from("!I", frame, 18)[0]
+
+    nonce = frame[22:46]
+
+    if frame_type == PROTOCOL_TYPE_CLIENT_ID:
+
+        if len(frame) != PROTOCOL_HEADER_SIZE:
+            raise ValueError("Invalid client-ID frame length")
+
+        return {
+            "version": version,
+            "type": frame_type,
+            "sender_id": sender_id,
+            "target_id": target_id,
+            "sequence": sequence,
+            "ciphertext_length": ciphertext_length,
+            "nonce": nonce,
+        }
+
+    if frame_type != PROTOCOL_TYPE_MESSAGE:
+        raise ValueError(
+            f"Unsupported protocol type: {frame_type}"
+        )
+
+    if ciphertext_length < CRYPTO_MAC_SIZE:
+        raise ValueError("Ciphertext too short")
+
+    expected_length = (
+        PROTOCOL_HEADER_SIZE + ciphertext_length
+    )
+
+    if len(frame) != expected_length:
+        raise ValueError(
+            f"Invalid frame length: expected {expected_length}, "
+            f"got {len(frame)}"
+        )
+
+    return {
+        "version": version,
+        "type": frame_type,
+        "sender_id": sender_id,
+        "target_id": target_id,
+        "sequence": sequence,
+        "ciphertext_length": ciphertext_length,
+        "nonce": nonce,
+        "ciphertext": frame[PROTOCOL_HEADER_SIZE:],
+        "header": frame[:PROTOCOL_HEADER_SIZE],
+    }
+
+
+def decrypt_message(key, frame):
+    """
+    Decrypt and authenticate a relay message.
+    """
+
+    info = parse_frame(frame)
+
+    if info["type"] != PROTOCOL_TYPE_MESSAGE:
+        raise ValueError("Frame is not a message")
+
+    aad = build_aad(info["header"])
+
+    plaintext = crypto_aead_xchacha20poly1305_ietf_decrypt(
+        info["ciphertext"],
+        aad,
+        info["nonce"],
+        key,
+    )
+
+    return plaintext, info
+
+
+# ============================================================
+# SOCKET HELPERS
+# ============================================================
+
+def recv_exact(sock, length):
+    """
+    Receive exactly length bytes.
+    """
+
+    data = bytearray()
+
+    while len(data) < length:
+
+        chunk = sock.recv(length - len(data))
+
+        if not chunk:
+            raise ConnectionError("Connection closed by server")
+
+        data.extend(chunk)
+
+    return bytes(data)
+
+
+def recv_frame(sock):
+    """
+    Receive one complete protocol frame.
+
+    Header is always 46 bytes.
+    Message ciphertext length is stored at bytes 18..21.
+    """
+
+    header = recv_exact(sock, PROTOCOL_HEADER_SIZE)
+
+    ciphertext_length = struct.unpack_from(
+        "!I",
+        header,
+        18,
+    )[0]
+
+    if header[1] == PROTOCOL_TYPE_CLIENT_ID:
+
+        if ciphertext_length != 0:
+            raise ValueError("Invalid client-ID frame")
+
+        return header
+
+    if header[1] != PROTOCOL_TYPE_MESSAGE:
+        raise ValueError(
+            f"Unknown protocol type: {header[1]}"
+        )
+
+    if ciphertext_length < CRYPTO_MAC_SIZE:
+        raise ValueError("Invalid ciphertext length")
+
+    if ciphertext_length > PROTOCOL_MAX_PAYLOAD + CRYPTO_MAC_SIZE:
+        raise ValueError("Ciphertext exceeds maximum payload")
+
+    ciphertext = recv_exact(
+        sock,
+        ciphertext_length,
+    )
+
+    return header + ciphertext
+
+
+# ============================================================
+# RELAY CONNECTION
+# ============================================================
+
+class RelayConnection:
+
+    def __init__(self):
+        self.sock = None
+        self.thread = None
+
+        self.running = False
+        self.connected = False
+
+        self.client_id = None
+
+        # Production relay starts incoming sequence at 1.
+        self.next_sequence = 1
+
+        self.key = None
+
+        self.events = queue.Queue()
+
+        self.lock = threading.Lock()
+
+        self.sent_messages = 0
+        self.received_messages = 0
+
+        self.bytes_sent = 0
+        self.bytes_received = 0
+
+        self.connected_at = None
+
+        self.known_peers = set()
+
+    # --------------------------------------------------------
+    # CONNECT
+    # --------------------------------------------------------
+
+    def connect(self, host, port, key):
+
+        self.disconnect()
+
+        self.key = key
+
+        sock = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+        )
+
+        sock.settimeout(10)
+
+        sock.connect(
+            (host, port)
+        )
+
+        sock.settimeout(None)
+
+        self.sock = sock
+        self.running = True
+        self.connected = True
+
+        self.connected_at = time.time()
+
+        self.next_sequence = 1
+
+        self.thread = threading.Thread(
+            target=self._receive_loop,
+            daemon=True,
+        )
+
+        self.thread.start()
+
+        self.events.put({
+            "kind": "connected",
+            "message": f"Connected to {host}:{port}",
+        })
+
+    # --------------------------------------------------------
+    # RECEIVE LOOP
+    # --------------------------------------------------------
+
+    def _receive_loop(self):
+
+        try:
+
+            while self.running:
+
+                frame = recv_frame(self.sock)
+
+                self.bytes_received += len(frame)
+
+                info = parse_frame(frame)
+
+                if info["type"] == PROTOCOL_TYPE_CLIENT_ID:
+
+                    self.client_id = info["target_id"]
+
+                    self.events.put({
+                        "kind": "client_id",
+                        "client_id": self.client_id,
+                        "message": (
+                            f"Assigned client ID #{self.client_id}"
+                        ),
+                    })
+
+                    continue
+
+                plaintext, info = decrypt_message(
+                    self.key,
+                    frame,
+                )
+
+                sender_id = info["sender_id"]
+                target_id = info["target_id"]
+                sequence = info["sequence"]
+
+                self.known_peers.add(sender_id)
+
+                self.received_messages += 1
+
+                try:
+                    message = plaintext.decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                except Exception:
+                    message = repr(plaintext)
+
+                self.events.put({
+                    "kind": "message",
+                    "sender_id": sender_id,
+                    "target_id": target_id,
+                    "sequence": sequence,
+                    "message": message,
+                    "bytes": len(frame),
+                })
+
+        except Exception as exc:
+
+            if self.running:
+
+                self.events.put({
+                    "kind": "error",
+                    "message": str(exc),
+                })
+
+        finally:
+
+            self.connected = False
+            self.running = False
+
+    # --------------------------------------------------------
+    # SEND
+    # --------------------------------------------------------
+
+    def send_message(self, target_id, message):
+
+        if not self.connected or self.sock is None:
+            raise ConnectionError("Not connected")
+
+        if self.client_id is None:
+            raise RuntimeError(
+                "Client ID has not been assigned yet"
+            )
+
+        plaintext = message.encode("utf-8")
+
+        sequence = self.next_sequence
+
+        frame = build_message_frame(
+            self.key,
+            self.client_id,
+            target_id,
+            sequence,
+            plaintext,
+        )
+
+        with self.lock:
+
+            self.sock.sendall(frame)
+
+        self.next_sequence += 1
+
+        self.sent_messages += 1
+        self.bytes_sent += len(frame)
+
+        self.events.put({
+            "kind": "sent",
+            "sender_id": self.client_id,
+            "target_id": target_id,
+            "sequence": sequence,
+            "message": message,
+            "bytes": len(frame),
+        })
+
+    # --------------------------------------------------------
+    # DISCONNECT
+    # --------------------------------------------------------
+
+    def disconnect(self):
+
+        self.running = False
+        self.connected = False
+
+        if self.sock is not None:
+
+            try:
+                self.sock.shutdown(
+                    socket.SHUT_RDWR
+                )
+            except Exception:
+                pass
+
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+        self.sock = None
+        self.client_id = None
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "relay" not in st.session_state:
+    st.session_state.relay = RelayConnection()
+
+if "page" not in st.session_state:
+    st.session_state.page = "Dashboard"
+
+if "activity" not in st.session_state:
+    st.session_state.activity = []
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "settings_host" not in st.session_state:
+    st.session_state.settings_host = DEFAULT_SERVER_HOST
+
+if "settings_port" not in st.session_state:
+    st.session_state.settings_port = DEFAULT_SERVER_PORT
+
+if "settings_key" not in st.session_state:
+    st.session_state.settings_key = str(DEFAULT_KEY_PATH)
+
+
+relay = st.session_state.relay
+
+
+# ============================================================
+# PROCESS EVENTS
+# ============================================================
+
+def process_events():
+
+    while True:
+
+        try:
+            event = relay.events.get_nowait()
+        except queue.Empty:
+            break
+
+        st.session_state.activity.insert(
+            0,
+            {
+                "time": time.strftime(
+                    "%H:%M:%S"
+                ),
+                **event,
+            },
+        )
+
+        if len(st.session_state.activity) > 100:
+            st.session_state.activity = (
+                st.session_state.activity[:100]
+            )
+
+        if event["kind"] == "message":
+
+            st.session_state.messages.append(
+                event
+            )
+
+            if len(st.session_state.messages) > 100:
+                st.session_state.messages = (
+                    st.session_state.messages[-100:]
+                )
+
+
+process_events()
+
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+
+# ============================================================
+# CSS
+# ============================================================
+
+st.markdown(
+    """
+<style>
+
+html, body, [class*="css"] {
+    font-family:
+        Inter,
+        ui-sans-serif,
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+}
+
+.stApp {
+    background: #0b0c0e;
+    color: #e7e7e9;
+}
+
+.block-container {
+    padding-top: 1.2rem;
+    padding-bottom: 2rem;
+    max-width: 1500px;
+}
+
+/* Sidebar */
+
+[data-testid="stSidebar"] {
+    background: #0a0b0d;
+    border-right: 1px solid #27282c;
+}
+
+[data-testid="stSidebar"] .block-container {
+    padding-top: 1.5rem;
+}
+
+/* Buttons */
+
+.stButton > button {
+    border-radius: 4px;
+    border: 1px solid #303136;
+    background: #17181b;
+    color: #d9d9dc;
+    min-height: 38px;
+    transition: all 0.15s ease;
+}
+
+.stButton > button:hover {
+    border-color: #55575d;
+    background: #202125;
+}
+
+/* Inputs */
+
+input, textarea {
+    background: #111216 !important;
+    color: #e7e7e9 !important;
+    border-color: #303136 !important;
+}
+
+/* Cards */
+
+.metric-card {
+    background: #17181b;
+    border: 1px solid #292a2e;
+    padding: 18px;
+    min-height: 95px;
+}
+
+.metric-label {
+    color: #85878e;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.metric-value {
+    color: #eeeeef;
+    font-size: 23px;
+    font-weight: 600;
+    margin-top: 7px;
+}
+
+.metric-sub {
+    color: #777981;
+    font-size: 12px;
+    margin-top: 4px;
+}
+
+.section {
+    background: #151619;
+    border: 1px solid #292a2e;
+    padding: 22px;
+    margin-top: 18px;
+}
+
+.section-title {
+    color: #a2a4aa;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    margin-bottom: 16px;
+}
+
+.green {
+    color: #51d49a;
+}
+
+.red {
+    color: #e97979;
+}
+
+.amber {
+    color: #d8ad65;
+}
+
+.muted {
+    color: #777981;
+}
+
+.title {
+    font-size: 30px;
+    font-weight: 650;
+    letter-spacing: -0.03em;
+}
+
+.subtitle {
+    color: #85878e;
+    margin-top: 3px;
+}
+
+.protocol-box {
+    background: #0d0e10;
+    border: 1px solid #292a2e;
+    padding: 18px;
+    font-family: "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.8;
+}
+
+.event-row {
+    border-bottom: 1px solid #25262a;
+    padding: 11px 0;
+    font-family: "SFMono-Regular", Consolas, monospace;
+    font-size: 12px;
+}
+
+.chat-in {
+    background: #17191c;
+    border-left: 2px solid #4fd39a;
+    padding: 13px;
+    margin: 7px 0;
+}
+
+.chat-out {
+    background: #151619;
+    border-right: 2px solid #777b85;
+    padding: 13px;
+    margin: 7px 0;
+}
+
+.badge {
+    display: inline-block;
+    padding: 4px 8px;
+    border: 1px solid #34363b;
+    background: #151619;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+}
+
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.markdown(
+        """
+        <div style="
+            font-size:18px;
+            font-weight:650;
+            letter-spacing:-0.02em;
+        ">
+            SECURE MULTI-CLIENT RELAY
+        </div>
+
+        <div style="
+            color:#777981;
+            font-size:11px;
+            margin-top:4px;
+            margin-bottom:25px;
+        ">
+            Route securely. Reveal nothing.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="section-title">OVERVIEW</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Dashboard", use_container_width=True):
+        st.session_state.page = "Dashboard"
+        st.rerun()
+
+    st.markdown(
+        '<div class="section-title" style="margin-top:22px;">COMMUNICATION</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Messages", use_container_width=True):
+        st.session_state.page = "Messages"
+        st.rerun()
+
+    if st.button("Clients", use_container_width=True):
+        st.session_state.page = "Clients"
+        st.rerun()
+
+    st.markdown(
+        '<div class="section-title" style="margin-top:22px;">SECURITY</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Security", use_container_width=True):
+        st.session_state.page = "Security"
+        st.rerun()
+
+    if st.button("Activity", use_container_width=True):
+        st.session_state.page = "Activity"
+        st.rerun()
+
+    st.markdown(
+        '<div class="section-title" style="margin-top:22px;">SYSTEM</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Settings", use_container_width=True):
+        st.session_state.page = "Settings"
+        st.rerun()
+
+    st.markdown("---")
+
+    if relay.connected:
+
+        st.markdown(
+            """
+            <div class="badge">
+                <span class="green">●</span>
+                CONNECTED
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if relay.client_id is not None:
+            st.caption(
+                f"Client #{relay.client_id}"
+            )
+
+        if st.button(
+            "Disconnect",
+            use_container_width=True,
+        ):
+            relay.disconnect()
+            st.rerun()
+
+    else:
+
+        st.markdown(
+            """
+            <div class="badge">
+                <span class="red">●</span>
+                DISCONNECTED
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# ============================================================
+# TOP BAR
+# ============================================================
+
+col_a, col_b, col_c = st.columns(
+    [5, 2, 2]
+)
+
+with col_a:
+
+    st.markdown(
+        """
+        <div style="
+            font-size:12px;
+            letter-spacing:0.08em;
+            color:#51d49a;
+        ">
+            RELAY NODE · RPI4
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with col_b:
+
+    status_text = (
+        "● ONLINE"
+        if relay.connected
+        else "● OFFLINE"
+    )
+
+    status_class = (
+        "green"
+        if relay.connected
+        else "red"
+    )
+
+    st.markdown(
+        f"""
+        <div style="
+            text-align:right;
+            font-family:monospace;
+            font-size:12px;
+        ">
+            <span class="{status_class}">
+                {status_text}
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with col_c:
+
+    st.markdown(
+        f"""
+        <div style="
+            text-align:right;
+            color:#777981;
+            font-family:monospace;
+            font-size:12px;
+        ">
+            TCP / EPOLL
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+if st.session_state.page == "Dashboard":
+
+    st.markdown(
+        '<div class="title">SECURE MULTI-CLIENT RELAY</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="subtitle">Live relay overview · Route securely. Reveal nothing.</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.write("")
+
+    client_display = (
+        f"#{relay.client_id}"
+        if relay.client_id is not None
+        else "—"
+    )
+
+    connection_display = (
+        "ONLINE"
+        if relay.connected
+        else "OFFLINE"
+    )
+
+    uptime = "—"
+
+    if relay.connected_at:
+        seconds = int(
+            time.time() - relay.connected_at
+        )
+
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+
+        uptime = (
+            f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        )
+
+    cols = st.columns(5)
+
+    metrics = [
+        (
+            "CONNECTION",
+            connection_display,
+            f"{DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}",
+        ),
+        (
+            "CLIENT",
+            client_display,
+            "Local relay endpoint",
+        ),
+        (
+            "OBSERVED PEERS",
+            str(len(relay.known_peers)),
+            "Seen in received traffic",
+        ),
+        (
+            "MESSAGES",
+            str(
+                relay.sent_messages
+                + relay.received_messages
+            ),
+            "This session",
+        ),
+        (
+            "UPTIME",
+            uptime,
+            "Worker pool: 4 threads",
+        ),
+    ]
+
+    for col, metric in zip(cols, metrics):
+
+        with col:
+
+            st.markdown(
+                f"""
+                <div class="metric-card">
+                    <div class="metric-label">
+                        {metric[0]}
+                    </div>
+                    <div class="metric-value">
+                        {metric[1]}
+                    </div>
+                    <div class="metric-sub">
+                        {metric[2]}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # Architecture
+
+    st.markdown(
+        """
+        <div class="section">
+            <div class="section-title">
+                TRANSPORT PIPELINE · TCP / EPOLL
+            </div>
+
+            <div class="protocol-box">
+
+                <div style="
+                    display:flex;
+                    align-items:center;
+                    justify-content:space-between;
+                    gap:20px;
+                ">
+
+                    <div>
+                        <span class="green">
+                            CLIENT
+                        </span>
+                        <br>
+                        plaintext
+                        <br>
+                        <span class="muted">
+                            encrypt locally
+                        </span>
+                    </div>
+
+                    <div class="muted">
+                        →
+                    </div>
+
+                    <div>
+                        <span class="green">
+                            XChaCha20-Poly1305-IETF
+                        </span>
+                        <br>
+                        encrypted frame
+                        <br>
+                        <span class="muted">
+                            46-byte header + ciphertext
+                        </span>
+                    </div>
+
+                    <div class="muted">
+                        →
+                    </div>
+
+                    <div>
+                        <span style="color:#9da5d8;">
+                            RELAY SERVER
+                        </span>
+                        <br>
+                        routing only
+                        <br>
+                        <span class="muted">
+                            payload remains opaque
+                        </span>
+                    </div>
+
+                    <div class="muted">
+                        →
+                    </div>
+
+                    <div>
+                        <span class="green">
+                            DESTINATION CLIENT
+                        </span>
+                        <br>
+                        decrypt locally
+                        <br>
+                        <span class="muted">
+                            plaintext revealed here
+                        </span>
+                    </div>
+
+                </div>
+
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Real session statistics
+
+    st.markdown(
+        '<div class="section">',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="section-title">LIVE SESSION</div>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        st.metric(
+            "Frames Sent",
+            relay.sent_messages,
+        )
+
+    with c2:
+        st.metric(
+            "Frames Received",
+            relay.received_messages,
+        )
+
+    with c3:
+        st.metric(
+            "Bytes Sent",
+            relay.bytes_sent,
+        )
+
+    with c4:
+        st.metric(
+            "Bytes Received",
+            relay.bytes_received,
+        )
+
+    st.markdown(
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# MESSAGES
+# ============================================================
+
+elif st.session_state.page == "Messages":
+
+    st.markdown(
+        '<div class="title">SECURE MESSAGES</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="subtitle">Encrypted client-to-client communication through the blind relay.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not relay.connected:
+
+        st.warning(
+            "Connect to the relay server from Settings before sending messages."
+        )
+
+    else:
+
+        st.markdown(
+            f"""
+            <div class="section">
+                <div class="section-title">
+                    SECURE CHANNEL
+                </div>
+
+                <span class="badge">
+                    <span class="green">●</span>
+                    CLIENT #{relay.client_id}
+                </span>
+
+                <span class="badge">
+                    XCHACHA20-POLY1305-IETF
+                </span>
+
+                <span class="badge">
+                    AAD AUTHENTICATED
+                </span>
+
+                <span class="badge">
+                    SEQ #{relay.next_sequence}
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.write("")
+
+        target_input = st.text_input(
+            "TARGET CLIENT",
+            placeholder="Enter client ID, or 0 for broadcast",
+        )
+
+        message_input = st.text_area(
+            "MESSAGE",
+            placeholder="Type your message...",
+            height=120,
+        )
+
+        send_col, broadcast_col = st.columns(2)
+
+        with send_col:
+
+            if st.button(
+                "SEND SECURE MESSAGE",
+                use_container_width=True,
+            ):
+
+                if not target_input.strip():
+                    st.error("Enter a target client ID.")
+
+                elif not message_input.strip():
+                    st.error("Enter a message.")
+
+                else:
+
+                    try:
+
+                        target_id = int(
+                            target_input.strip()
+                        )
+
+                        relay.send_message(
+                            target_id,
+                            message_input,
+                        )
+
+                        st.success(
+                            f"Encrypted frame sent to client #{target_id}."
+                        )
+
+                    except Exception as exc:
+
+                        st.error(
+                            f"Send failed: {exc}"
+                        )
+
+        with broadcast_col:
+
+            if st.button(
+                "BROADCAST TO ALL",
+                use_container_width=True,
+            ):
+
+                if not message_input.strip():
+                    st.error("Enter a message.")
+
+                else:
+
+                    try:
+
+                        relay.send_message(
+                            BROADCAST_ID,
+                            message_input,
+                        )
+
+                        st.success(
+                            "Encrypted broadcast frame sent."
+                        )
+
+                    except Exception as exc:
+
+                        st.error(
+                            f"Broadcast failed: {exc}"
+                        )
+
+        st.markdown(
+            '<div class="section-title" style="margin-top:25px;">MESSAGE STREAM</div>',
+            unsafe_allow_html=True,
+        )
+
+        for item in reversed(
+            st.session_state.messages[-30:]
+        ):
+
+            sender = item["sender_id"]
+            target = item["target_id"]
+            seq = item["sequence"]
+            message = item["message"]
+
+            is_self = (
+                relay.client_id == sender
+            )
+
+            css_class = (
+                "chat-out"
+                if is_self
+                else "chat-in"
+            )
+
+            st.markdown(
+                f"""
+                <div class="{css_class}">
+                    <div style="
+                        color:#777981;
+                        font-size:11px;
+                        font-family:monospace;
+                    ">
+                        #{sender}
+                        →
+                        #{target}
+                        · SEQ #{seq}
+                    </div>
+
+                    <div style="
+                        margin-top:6px;
+                        font-size:14px;
+                    ">
+                        {message}
+                    </div>
+
+                    <div style="
+                        margin-top:7px;
+                        color:#51d49a;
+                        font-size:10px;
+                        font-family:monospace;
+                    ">
+                        DECRYPTED CLIENT-SIDE
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+# ============================================================
+# CLIENTS
+# ============================================================
+
+elif st.session_state.page == "Clients":
+
+    st.markdown(
+        '<div class="title">CLIENTS</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="subtitle">Client identities observed through this relay session.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if relay.client_id is not None:
+
+        st.markdown(
+            f"""
+            <div class="section">
+
+                <div class="section-title">
+                    LOCAL CLIENT
+                </div>
+
+                <div style="
+                    font-family:monospace;
+                    font-size:16px;
+                ">
+                    CLIENT #{relay.client_id}
+                </div>
+
+                <div style="
+                    color:#51d49a;
+                    margin-top:6px;
+                ">
+                    ● CONNECTED
+                </div>
+
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        '<div class="section">',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="section-title">OBSERVED PEERS</div>',
+        unsafe_allow_html=True,
+    )
+
+    if relay.known_peers:
+
+        for peer in sorted(relay.known_peers):
+
+            if peer == relay.client_id:
+                continue
+
+            st.markdown(
+                f"""
+                <div style="
+                    border-bottom:1px solid #292a2e;
+                    padding:13px 0;
+                    font-family:monospace;
+                ">
+                    CLIENT #{peer}
+                    <span style="
+                        float:right;
+                        color:#777981;
+                    ">
+                        OBSERVED
+                    </span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    else:
+
+        st.info(
+            "No other client IDs have been observed yet."
+        )
+
+    st.markdown(
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.caption(
+        "The relay protocol does not expose a client-list API to the frontend. "
+        "Therefore this page only shows the local client and peers observed "
+        "through encrypted traffic."
+    )
+
+
+# ============================================================
+# SECURITY
+# ============================================================
+
+elif st.session_state.page == "Security":
+
+    st.markdown(
+        '<div class="title">SECURITY</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="subtitle">Cryptographic and protocol protections implemented by the relay.</div>',
+        unsafe_allow_html=True,
+    )
+
+    security_items = [
+        (
+            "XChaCha20-Poly1305-IETF",
+            "ACTIVE",
+            "Authenticated encryption",
+        ),
+        (
+            "32-BYTE KEY",
+            "ACTIVE",
+            "Shared key",
+        ),
+        (
+            "24-BYTE NONCE",
+            "ACTIVE",
+            "Per-message nonce",
+        ),
+        (
+            "16-BYTE MAC",
+            "ACTIVE",
+            "Authentication tag",
+        ),
+        (
+            "AAD ROUTING INTEGRITY",
+            "ACTIVE",
+            "Routing metadata authenticated",
+        ),
+        (
+            "SENDER VALIDATION",
+            "ACTIVE",
+            "Sender ID bound to connection",
+        ),
+        (
+            "REPLAY PROTECTION",
+            "ACTIVE",
+            "Strict sequence validation",
+        ),
+        (
+            "PROTOCOL VALIDATION",
+            "ACTIVE",
+            "Version and length checks",
+        ),
+        (
+            "BLIND RELAY",
+            "ACTIVE",
+            "Server does not decrypt payload",
+        ),
+    ]
+
+    for i in range(0, len(security_items), 3):
+
+        cols = st.columns(3)
+
+        for col, item in zip(
+            cols,
+            security_items[i:i + 3],
+        ):
+
+            with col:
+
+                st.markdown(
+                    f"""
+                    <div class="metric-card">
+                        <div class="metric-label">
+                            {item[0]}
+                        </div>
+
+                        <div class="metric-value green"
+                             style="font-size:18px;">
+                            ● {item[1]}
+                        </div>
+
+                        <div class="metric-sub">
+                            {item[2]}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown(
+        """
+        <div class="section">
+
+            <div class="section-title">
+                PROTOCOL FRAME
+            </div>
+
+            <div class="protocol-box">
+
+                VERSION
+                <span class="muted">1 byte</span>
+                <br>
+
+                TYPE
+                <span class="muted">1 byte</span>
+                <br>
+
+                SENDER ID
+                <span class="muted">4 bytes</span>
+                <br>
+
+                TARGET ID
+                <span class="muted">4 bytes</span>
+                <br>
+
+                SEQUENCE
+                <span class="muted">8 bytes</span>
+                <br>
+
+                CIPHERTEXT LENGTH
+                <span class="muted">4 bytes</span>
+                <br>
+
+                NONCE
+                <span class="muted">24 bytes</span>
+                <br>
+
+                ─────────────────────────────
+                <br>
+
+                <span class="green">
+                    TOTAL HEADER: 46 BYTES
+                </span>
+
+                <br><br>
+
+                AAD:
+                <span class="green">
+                    HEADER BYTES 0..21 + 42..45
+                </span>
+
+            </div>
+
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+        <div class="section">
+
+            <div class="section-title">
+                SECURITY MODEL
+            </div>
+
+            <div class="protocol-box">
+
+CLIENT
+<br>
+&nbsp;&nbsp;↓
+<br>
+plaintext
+<br>
+&nbsp;&nbsp;↓
+<br>
+XChaCha20-Poly1305-IETF
+<br>
+&nbsp;&nbsp;↓
+<br>
+authenticated encrypted frame
+<br>
+&nbsp;&nbsp;↓
+<br>
+RELAY SERVER
+<br>
+&nbsp;&nbsp;↓
+<br>
+routing only
+<br>
+&nbsp;&nbsp;↓
+<br>
+encrypted frame
+<br>
+&nbsp;&nbsp;↓
+<br>
+DESTINATION CLIENT
+<br>
+&nbsp;&nbsp;↓
+<br>
+decrypt
+<br>
+&nbsp;&nbsp;↓
+<br>
+plaintext
+
+            </div>
+
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# ACTIVITY
+# ============================================================
+
+elif st.session_state.page == "Activity":
+
+    st.markdown(
+        '<div class="title">ACTIVITY</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="subtitle">Live events from this frontend session.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if not st.session_state.activity:
+
+        st.info(
+            "No activity yet."
+        )
+
+    else:
+
+        for event in st.session_state.activity:
+
+            kind = event.get(
+                "kind",
+                "event",
+            )
+
+            if kind == "message":
+                label = "MESSAGE RECEIVED"
+            elif kind == "sent":
+                label = "MESSAGE SENT"
+            elif kind == "connected":
+                label = "CONNECTED"
+            elif kind == "client_id":
+                label = "CLIENT ID ASSIGNED"
+            elif kind == "error":
+                label = "ERROR"
+            else:
+                label = kind.upper()
+
+            st.markdown(
+                f"""
+                <div class="event-row">
+
+                    <span style="color:#777981;">
+                        {event.get("time", "")}
+                    </span>
+
+                    &nbsp;&nbsp;
+
+                    <span style="color:#d9d9dc;">
+                        {label}
+                    </span>
+
+                    &nbsp;&nbsp;
+
+                    <span class="muted">
+                        {event.get("message", "")}
+                    </span>
+
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+elif st.session_state.page == "Settings":
+
+    st.markdown(
+        '<div class="title">SETTINGS</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="subtitle">Relay connection configuration.</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="section">',
+        unsafe_allow_html=True,
+    )
+
+    host = st.text_input(
+        "RELAY SERVER",
+        value=st.session_state.settings_host,
+    )
+
+    port = st.number_input(
+        "PORT",
+        min_value=1,
+        max_value=65535,
+        value=st.session_state.settings_port,
+    )
+
+    key_path = st.text_input(
+        "SHARED KEY",
+        value=st.session_state.settings_key,
+    )
+
+    st.markdown(
+        """
+        <div style="
+            color:#777981;
+            font-size:12px;
+            margin-top:8px;
+        ">
+            The key file contains the same 32-byte shared key
+            used by the C relay server.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.write("")
+
+    if st.button(
+        "CONNECT TO RELAY",
+        use_container_width=True,
+    ):
+
+        try:
+
+            key = load_key(
+                key_path
+            )
+
+            relay.connect(
+                host,
+                int(port),
+                key,
+            )
+
+            st.session_state.settings_host = host
+            st.session_state.settings_port = int(port)
+            st.session_state.settings_key = key_path
+
+            st.success(
+                "TCP connection established. Waiting for client ID."
+            )
+
+            st.rerun()
+
+        except Exception as exc:
+
+            st.error(
+                f"Connection failed: {exc}"
+            )
+
+    st.markdown(
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# AUTO REFRESH WHILE CONNECTED
+# ============================================================
+
+if relay.connected:
+
+    time.sleep(0.05)
+
+    st.rerun()

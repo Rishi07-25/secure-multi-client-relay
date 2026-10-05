@@ -1,0 +1,393 @@
+"""Streamlit client for the secure multi-client relay.
+
+This UI is a real client: it encrypts locally, sends protocol frames over TCP,
+and decrypts only frames delivered to this client by the blind C relay.
+"""
+
+from __future__ import annotations
+
+import queue
+import socket
+import struct
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import streamlit as st
+
+from relay_protocol import (
+    CRYPTO_MAC_SIZE,
+    CRYPTO_NONCE_SIZE,
+    CRYPTO_KEY_SIZE,
+    PROTOCOL_BROADCAST_ID,
+    PROTOCOL_HEADER_SIZE,
+    PROTOCOL_MAX_PAYLOAD,
+    PROTOCOL_TYPE_CLIENT_ID,
+    PROTOCOL_TYPE_MESSAGE,
+    PROTOCOL_VERSION,
+    build_message_frame,
+    decrypt_message,
+    load_key,
+    parse_frame,
+)
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_SERVER_HOST = "192.168.2.2"
+DEFAULT_SERVER_PORT = 9090
+DEFAULT_KEY_PATH = PROJECT_ROOT / "config" / "shared.key"
+
+
+def recv_exact(sock: socket.socket, length: int) -> bytes:
+    """Read exactly *length* bytes; TCP does not preserve frame boundaries."""
+    data = bytearray()
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
+        if not chunk:
+            raise ConnectionError("Relay closed the connection")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def recv_frame(sock: socket.socket) -> bytes:
+    """Receive and validate one 46-byte-header relay frame."""
+    header = recv_exact(sock, PROTOCOL_HEADER_SIZE)
+    frame_type = header[1]
+    ciphertext_length = struct.unpack_from(">I", header, 18)[0]
+
+    if frame_type == PROTOCOL_TYPE_CLIENT_ID:
+        if ciphertext_length != 0:
+            raise ValueError("Client-ID control frame has a payload")
+        return header
+    if frame_type != PROTOCOL_TYPE_MESSAGE:
+        raise ValueError(f"Unsupported protocol frame type: {frame_type}")
+    if not CRYPTO_MAC_SIZE <= ciphertext_length <= PROTOCOL_MAX_PAYLOAD + CRYPTO_MAC_SIZE:
+        raise ValueError("Invalid encrypted payload length")
+    return header + recv_exact(sock, ciphertext_length)
+
+
+@dataclass(frozen=True)
+class SessionEvent:
+    when: float
+    kind: str
+    detail: str
+
+
+class RelayConnection:
+    """One lifecycle-managed relay TCP connection for a Streamlit browser session."""
+
+    def __init__(self) -> None:
+        self._socket: socket.socket | None = None
+        self._receiver: threading.Thread | None = None
+        self._running = threading.Event()
+        self._lock = threading.RLock()
+        self._events: queue.Queue[dict] = queue.Queue()
+        self.connected = False
+        self.client_id: int | None = None
+        self.key: bytes | None = None
+        self.next_sequence = 1
+        self.connected_at: float | None = None
+        self.sent_messages = 0
+        self.received_messages = 0
+        self.bytes_sent = 0
+        self.bytes_received = 0
+        self.known_peers: set[int] = set()
+        self.activity: list[SessionEvent] = []
+        self.messages: list[dict] = []
+
+    def _record(self, kind: str, detail: str) -> None:
+        self._events.put({"when": time.time(), "kind": kind, "detail": detail})
+
+    def drain_events(self) -> None:
+        """Move receiver events into UI-owned collections during a Streamlit run."""
+        while True:
+            try:
+                event = self._events.get_nowait()
+            except queue.Empty:
+                return
+            with self._lock:
+                self.activity.append(SessionEvent(event["when"], event["kind"], event["detail"]))
+                self.activity = self.activity[-200:]
+                if event["kind"] == "message":
+                    self.messages.append(event)
+                    self.messages = self.messages[-200:]
+
+    def connect(self, host: str, port: int, key: bytes) -> None:
+        self.disconnect(reason="Reconnecting")
+        sock = socket.create_connection((host, port), timeout=10)
+        sock.settimeout(None)
+        with self._lock:
+            self._socket = sock
+            self.key = key
+            self.connected = True
+            self.client_id = None
+            self.next_sequence = 1
+            self.connected_at = time.time()
+            self.sent_messages = self.received_messages = 0
+            self.bytes_sent = self.bytes_received = 0
+            self.known_peers.clear()
+            self.messages.clear()
+            self.activity.clear()
+            self._running.set()
+        self._receiver = threading.Thread(target=self._receive_loop, name="relay-receiver", daemon=True)
+        self._receiver.start()
+        self._record("connected", f"Connected to {host}:{port}; awaiting assigned client ID")
+
+    def _receive_loop(self) -> None:
+        try:
+            while self._running.is_set():
+                with self._lock:
+                    sock = self._socket
+                    key = self.key
+                if sock is None or key is None:
+                    return
+                frame = recv_frame(sock)
+                info = parse_frame(frame)
+                with self._lock:
+                    self.bytes_received += len(frame)
+                if info["type"] == PROTOCOL_TYPE_CLIENT_ID:
+                    assigned_id = info["target_id"]
+                    with self._lock:
+                        self.client_id = assigned_id
+                    self._record("assigned", f"Relay assigned local client ID #{assigned_id}")
+                    continue
+                info, plaintext = decrypt_message(key, frame)
+                text = plaintext.decode("utf-8", errors="replace")
+                with self._lock:
+                    self.received_messages += 1
+                    self.known_peers.add(info["sender_id"])
+                destination = "broadcast" if info["target_id"] == PROTOCOL_BROADCAST_ID else f"client #{info['target_id']}"
+                self._events.put({
+                    "when": time.time(), "kind": "message", "direction": "received",
+                    "sender_id": info["sender_id"], "target_id": info["target_id"],
+                    "sequence": info["sequence"], "text": text, "bytes": len(frame),
+                    "detail": f"Received authenticated encrypted message from #{info['sender_id']} to {destination} (sequence {info['sequence']})",
+                })
+        except Exception as exc:
+            if self._running.is_set():
+                self._record("error", f"Receive loop stopped: {exc}")
+        finally:
+            with self._lock:
+                self.connected = False
+            self._running.clear()
+
+    def send_message(self, target_id: int, text: str) -> None:
+        plaintext = text.encode("utf-8")
+        if not plaintext:
+            raise ValueError("Message cannot be empty")
+        if len(plaintext) > PROTOCOL_MAX_PAYLOAD:
+            raise ValueError(f"Message exceeds {PROTOCOL_MAX_PAYLOAD} UTF-8 bytes")
+        with self._lock:
+            if not self.connected or self._socket is None or self.key is None:
+                raise ConnectionError("Not connected to the relay")
+            if self.client_id is None:
+                raise RuntimeError("The relay has not assigned this client an ID yet")
+            sequence = self.next_sequence
+            frame = build_message_frame(self.key, self.client_id, target_id, sequence, plaintext)
+            self._socket.sendall(frame)
+            self.next_sequence += 1
+            self.sent_messages += 1
+            self.bytes_sent += len(frame)
+        destination = "broadcast" if target_id == PROTOCOL_BROADCAST_ID else f"client #{target_id}"
+        self._events.put({
+            "when": time.time(), "kind": "message", "direction": "sent",
+            "sender_id": self.client_id, "target_id": target_id, "sequence": sequence,
+            "text": text, "bytes": len(frame),
+            "detail": f"Sent authenticated encrypted message to {destination} (sequence {sequence})",
+        })
+
+    def disconnect(self, reason: str = "Disconnected by user") -> None:
+        was_active = self._running.is_set() or self.connected
+        self._running.clear()
+        with self._lock:
+            sock, self._socket = self._socket, None
+            self.connected = False
+            self.client_id = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        receiver = self._receiver
+        if receiver is not None and receiver is not threading.current_thread():
+            receiver.join(timeout=1)
+        if was_active:
+            self._record("disconnected", reason)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "connected": self.connected, "client_id": self.client_id,
+                "sent": self.sent_messages, "received": self.received_messages,
+                "bytes_sent": self.bytes_sent, "bytes_received": self.bytes_received,
+                "connected_at": self.connected_at, "peers": sorted(self.known_peers),
+            }
+
+
+def connection() -> RelayConnection:
+    if "relay_connection" not in st.session_state:
+        st.session_state.relay_connection = RelayConnection()
+    return st.session_state.relay_connection
+
+
+def fmt_bytes(value: int) -> str:
+    return f"{value:,} B"
+
+
+def uptime(connected_at: float | None) -> str:
+    if connected_at is None:
+        return "—"
+    seconds = max(0, int(time.time() - connected_at))
+    return f"{seconds // 3600:02}:{(seconds % 3600) // 60:02}:{seconds % 60:02}"
+
+
+def style() -> None:
+    st.markdown("""<style>
+    .stApp { background: #07111f; color: #dce8f7; }
+    [data-testid="stSidebar"] { background: #0b1728; }
+    .metric-card { background: linear-gradient(145deg,#0d2138,#0a1728); border: 1px solid #1c4667;
+      border-radius: 12px; padding: 1rem; min-height: 92px; }
+    .metric-label { color: #8aa5c3; font-size: .82rem; text-transform: uppercase; letter-spacing: .08em; }
+    .metric-value { color: #eaf5ff; font-size: 1.55rem; font-weight: 700; margin-top: .25rem; }
+    .status-ok { color: #44d19d; } .status-off { color: #ff8b8b; }
+    .architecture { border: 1px solid #1c4667; background: #09192b; border-radius: 12px; padding: 1rem; }
+    </style>""", unsafe_allow_html=True)
+
+
+def metric(label: str, value: str) -> None:
+    st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div></div>', unsafe_allow_html=True)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Secure Relay", page_icon="🔐", layout="wide")
+    style()
+    relay = connection()
+    relay.drain_events()
+    state = relay.snapshot()
+
+    with st.sidebar:
+        st.title("Secure Relay")
+        st.caption("Blind encrypted message relay")
+        st.divider()
+        page = st.radio("Workspace", ["Dashboard", "Messages", "Clients", "Security", "Activity", "Settings"])
+        st.divider()
+        if state["connected"]:
+            st.success(f"Connected · client #{state['client_id'] if state['client_id'] is not None else '…'}")
+        else:
+            st.error("Disconnected")
+        if st.button("Refresh session data", use_container_width=True):
+            relay.drain_events()
+            st.rerun()
+        st.caption("Refresh is manual; there is no automatic rerun loop.")
+
+    if page == "Dashboard":
+        st.title("Network command center")
+        st.caption("All measurements below come from this Streamlit client session only.")
+        columns = st.columns(5)
+        labels = [("Connection", "Online" if state["connected"] else "Offline"), ("Local client ID", f"#{state['client_id']}" if state["client_id"] is not None else "Awaiting relay"), ("Messages sent", str(state["sent"])), ("Messages received", str(state["received"])), ("Session uptime", uptime(state["connected_at"]))]
+        for column, (label, value) in zip(columns, labels):
+            with column: metric(label, value)
+        st.subheader("Local traffic counters")
+        a, b = st.columns(2)
+        with a: metric("Encrypted frame bytes sent", fmt_bytes(state["bytes_sent"]))
+        with b: metric("Encrypted frame bytes received", fmt_bytes(state["bytes_received"]))
+        st.subheader("Truthful relay path")
+        st.markdown("""<div class="architecture">
+        <b>Streamlit client</b> encrypts plaintext locally → <b>C relay on TCP :9090</b> validates frame structure,
+        sender ID, and incoming sequence → routes the opaque encrypted frame → <b>destination client</b> authenticates and decrypts locally.<br><br>
+        The relay does not decrypt message payloads. This UI has no server-side client count, queue depth, latency, or telemetry API.
+        </div>""", unsafe_allow_html=True)
+        st.subheader("Protocol")
+        st.code("v1  •  TCP framing  •  46-byte header  •  XChaCha20-Poly1305-IETF", language=None)
+
+    elif page == "Messages":
+        st.title("Secure workstation")
+        if not state["connected"]:
+            st.info("Connect from Settings before sending messages.")
+        elif state["client_id"] is None:
+            st.warning("TCP is connected; waiting for the relay's assigned client ID. Refresh shortly.")
+        else:
+            with st.form("send-message", clear_on_submit=True):
+                target = st.text_input("Target client ID", value="0", help="Use 0 for broadcast. Direct targets must be positive client IDs.")
+                text = st.text_area("Message", max_chars=PROTOCOL_MAX_PAYLOAD, placeholder="Write a message to encrypt locally…")
+                submitted = st.form_submit_button("Encrypt locally and send", type="primary")
+            if submitted:
+                try:
+                    target_id = int(target, 10)
+                    if not 0 <= target_id <= 0xFFFFFFFF:
+                        raise ValueError("Target ID must be between 0 and 4,294,967,295")
+                    relay.send_message(target_id, text)
+                    relay.drain_events()
+                    st.success("Encrypted frame sent.")
+                    st.rerun()
+                except (ValueError, RuntimeError, ConnectionError, OSError) as exc:
+                    st.error(str(exc))
+        st.subheader("Session messages")
+        relay.drain_events()
+        if not relay.messages:
+            st.caption("No sent or received messages in this browser session.")
+        for message in reversed(relay.messages):
+            direction = "Sent" if message["direction"] == "sent" else "Received"
+            destination = "broadcast" if message["target_id"] == 0 else f"#{message['target_id']}"
+            st.markdown(f"**{direction}** · sender #{message['sender_id']} → {destination} · sequence `{message['sequence']}` · authenticated & encrypted")
+            st.code(message["text"], language=None)
+
+    elif page == "Clients":
+        st.title("Observed clients")
+        st.caption("This is not a server client list. It shows only identities this frontend has actually observed.")
+        st.metric("Local assigned client ID", f"#{state['client_id']}" if state["client_id"] is not None else "Not assigned")
+        if state["peers"]:
+            st.write("Peer IDs observed from received traffic:", ", ".join(f"#{peer}" for peer in state["peers"]))
+        else:
+            st.info("No peers have been observed in received traffic yet.")
+
+    elif page == "Security":
+        st.title("Cryptographic console")
+        st.markdown("""- **XChaCha20-Poly1305-IETF** authenticated encryption, using a 32-byte shared key.
+        - A fresh **24-byte nonce** is generated for every locally sent message.
+        - Each ciphertext includes a **16-byte authentication tag**.
+        - Routing metadata is authenticated as AAD: header bytes 0–21 plus 42–45 (26 bytes).
+        - The C relay validates protocol version, length, and claimed sender ID; it enforces strict incoming sequence numbers beginning at 1.
+        - The relay is **blind**: it routes encrypted frames and does not decrypt message payloads.
+
+        This UI does not claim TLS, certificates, Ed25519 signatures, ratchets, hardware enclaves, or server telemetry.""")
+
+    elif page == "Activity":
+        st.title("Frontend session activity")
+        relay.drain_events()
+        if not relay.activity:
+            st.caption("No activity yet.")
+        for event in reversed(relay.activity):
+            stamp = time.strftime("%H:%M:%S", time.localtime(event.when))
+            st.write(f"`{stamp}` · **{event.kind}** · {event.detail}")
+
+    else:
+        st.title("Connection settings")
+        st.caption("Changes apply when you select Connect. The key is read locally and is never displayed.")
+        with st.form("connection-settings"):
+            host = st.text_input("Relay host", value=st.session_state.get("host", DEFAULT_SERVER_HOST))
+            port = st.number_input("TCP port", min_value=1, max_value=65535, value=int(st.session_state.get("port", DEFAULT_SERVER_PORT)), step=1)
+            key_path = st.text_input("Shared key path", value=st.session_state.get("key_path", str(DEFAULT_KEY_PATH)))
+            connect_clicked = st.form_submit_button("Connect", type="primary")
+        if connect_clicked:
+            try:
+                key = load_key(key_path)
+                relay.connect(host.strip(), int(port), key)
+                st.session_state.update(host=host.strip(), port=int(port), key_path=key_path)
+                st.success("TCP connection established; waiting for the relay's client-ID frame.")
+                st.rerun()
+            except (OSError, ValueError, ConnectionError) as exc:
+                st.error(f"Could not connect: {exc}")
+        if state["connected"] and st.button("Disconnect"):
+            relay.disconnect()
+            relay.drain_events()
+            st.rerun()
+
+
+if __name__ == "__main__":
+    main()
