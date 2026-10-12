@@ -1,0 +1,11 @@
+# Relay Chat theme. Streamlit reads this when launched from the project root
+# (see README); frontend/app.py also applies the same palette via CSS.
+[theme]
+base = "dark"
+primaryColor = "#0EA5E9"
+backgroundColor = "#0B0F17"
+secondaryBackgroundColor = "#161F30"
+textColor = "#F8FAFC"
+
+[client]
+toolbarMode = "minimal"
