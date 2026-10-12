@@ -247,50 +247,288 @@ def uptime(connected_at: float | None) -> str:
     return f"{seconds // 3600:02}:{(seconds % 3600) // 60:02}:{seconds % 60:02}"
 
 
-def conversation_preview(messages: list[dict], target: int, local_client_id: int | None) -> str:
-    """Return a real, short preview for one locally observed conversation."""
-    for message in reversed(messages):
+def chat_name(target: int) -> str:
+    return "Broadcast" if target == PROTOCOL_BROADCAST_ID else f"Client #{target}"
+
+
+def conversation_for(messages: list[dict], target: int, local_client_id: int | None) -> list[dict]:
+    """Messages this browser session sent to, or received in, one conversation."""
+    conversation = []
+    for message in messages:
         if message["direction"] == "sent" and message["target_id"] == target:
-            text = f"You: {message['text']}"
-            return text[:42] + ("…" if len(text) > 42 else "")
-        if message["direction"] == "received":
+            conversation.append(message)
+        elif message["direction"] == "received":
             is_broadcast = target == 0 and message["target_id"] == 0
-            is_direct = (
+            is_direct_to_this_client = (
                 target != 0
                 and message["sender_id"] == target
                 and message["target_id"] == local_client_id
             )
-            if is_broadcast or is_direct:
-                text = message["text"]
-                return text[:42] + ("…" if len(text) > 42 else "")
-    return "No messages yet"
+            if is_broadcast or is_direct_to_this_client:
+                conversation.append(message)
+    return conversation
+
+
+def conversation_preview(conversation: list[dict]) -> str:
+    """Return a real, short preview for one locally observed conversation."""
+    if not conversation:
+        return "No messages yet"
+    message = conversation[-1]
+    text = f"You: {message['text']}" if message["direction"] == "sent" else message["text"]
+    text = " ".join(text.split())
+    return text[:40] + ("…" if len(text) > 40 else "")
+
+
+def received_count(conversation: list[dict]) -> int:
+    return sum(1 for message in conversation if message["direction"] == "received")
+
+
+def last_error(relay: RelayConnection) -> str | None:
+    """The most recent receive error, if it happened after the last connect."""
+    for event in reversed(relay.activity):
+        if event.kind == "error":
+            return event.detail
+        if event.kind == "connected":
+            return None
+    return None
+
+
+LOGO_SVG = (
+    '<svg class="rc-logo" viewBox="0 0 32 32" width="32" height="32" aria-hidden="true">'
+    '<rect x="1" y="1" width="30" height="30" rx="8" fill="#161F30" stroke="#334155"/>'
+    '<path d="M21.5 10.5h-9a3 3 0 0 0 0 6h7a3 3 0 0 1 0 6h-9" fill="none" stroke="#F8FAFC" '
+    'stroke-width="3" stroke-linecap="round"/></svg>'
+)
+LOCK_SVG = (
+    '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><rect x="3" y="7" width="10" height="7" '
+    'rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" '
+    'fill="none" stroke="currentColor" stroke-width="1.5"/></svg>'
+)
+CHECK_SVG = (
+    '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="8" cy="8" r="6.25" fill="none" '
+    'stroke="currentColor" stroke-width="1.5"/><path d="M5.3 8.2l1.8 1.8 3.6-3.8" fill="none" stroke="currentColor" '
+    'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+)
+SHIELD_SVG = (
+    '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M8 1.5l5 2v4.2c0 3.1-2.1 5.6-5 6.8'
+    '-2.9-1.2-5-3.7-5-6.8V3.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>'
+)
 
 
 def style() -> None:
-    st.markdown("""<style>
-    .stApp { background: #0b141a; color: #e9edef; }
-    [data-testid="stSidebar"] { background: #111b21; border-right: 1px solid #27363d; }
-    [data-testid="stSidebar"] .stButton > button { justify-content: flex-start; background: transparent; border: 0; color: #e9edef; }
-    [data-testid="stSidebar"] .stButton > button:hover { background: #202c33; }
-    .chat-title { font-size: 1.25rem; font-weight: 650; color: #e9edef; margin-bottom: .1rem; }
-    .chat-subtitle { color: #8696a0; font-size: .88rem; }
-    .topbar { background: #202c33; border-radius: 8px; padding: .75rem 1rem; margin-bottom: 1rem; }
-    .topbar-name { font-size: 1.08rem; font-weight: 650; color: #e9edef; }
-    .topbar-meta { color: #00a884; font-size: .83rem; }
-    .empty-chat { color: #8696a0; text-align: center; padding: 4.5rem 1rem; }
-    .conversation-preview { color: #8696a0; font-size: .74rem; margin: -.45rem .35rem .5rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .message-row { display: flex; width: 100%; margin: .35rem 0; }
-    .message-row.outgoing { justify-content: flex-end; }
-    .message-row.incoming { justify-content: flex-start; }
-    .message-bubble { max-width: min(78%, 720px); border-radius: 9px; padding: .55rem .7rem .4rem; line-height: 1.35; }
-    .message-bubble.outgoing { background: #005c4b; color: #eefbf7; border-top-right-radius: 2px; }
-    .message-bubble.incoming { background: #202c33; color: #e9edef; border-top-left-radius: 2px; }
-    .message-bubble.broadcast { border-left: 3px solid #f5b942; }
-    .message-meta { color: #b9d9d0; font-size: .7rem; text-align: right; margin-top: .3rem; }
-    .message-bubble.incoming .message-meta { color: #9eb2bb; }
-    .chat-divider { color: #8696a0; font-size: .75rem; text-align: center; margin: 1.2rem 0 .8rem; }
-    .session-note { color: #8696a0; font-size: .78rem; text-align: center; margin-top: .5rem; }
-    </style>""", unsafe_allow_html=True)
+    st.html("""<style>
+    @import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+    :root {
+        --void: #0B0F17; --base: #111827; --raised: #161F30; --line: #1E293B; --line-strong: #334155;
+        --text: #F8FAFC; --text-2: #94A3B8; --muted: #64748B;
+        --blue: #0EA5E9; --blue-hi: #38BDF8; --green: #10B981; --green-hi: #34D399;
+        --amber: #F59E0B; --amber-hi: #FBBF24; --red: #EF4444; --red-hi: #F87171;
+        --sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .stApp { background: var(--void); color: var(--text); font-family: var(--sans); }
+    .stApp p, .stApp label, .stApp input, .stApp textarea, .stApp button { font-family: var(--sans); }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stAppDeployButton"], .stAppDeployButton, [data-testid="stDecoration"] { display: none; }
+    [data-testid="stMainBlockContainer"] { padding: 1.4rem 2rem 1.5rem; max-width: 1280px; }
+    [data-testid="stSidebar"] { background: var(--base); border-right: 1px solid var(--line); }
+    [data-testid="stSidebarContent"] { padding-top: .25rem; }
+    [data-testid="stSidebarUserContent"] { padding: 0 1rem 1.5rem; }
+    [data-testid="stSidebarHeader"] { padding-bottom: 0; margin-bottom: 0; height: 2.75rem; }
+
+    /* inputs and buttons */
+    [data-baseweb="input"], [data-baseweb="base-input"], [data-testid="stNumberInputContainer"] {
+        background: var(--void) !important; border-color: var(--line) !important; border-radius: 8px; }
+    [data-baseweb="input"] input { font-family: var(--mono); font-size: 13px; color: var(--text); }
+    [data-testid="stWidgetLabel"] p { font-family: var(--mono); font-size: 10.5px; letter-spacing: .08em;
+        text-transform: uppercase; color: var(--text-2); }
+    .stButton > button { border-radius: 8px; font-weight: 600; min-height: 36px; }
+    .stButton > button[kind="primary"] { background: var(--blue); border: 1px solid var(--blue-hi); color: var(--void); }
+    .stButton > button[kind="primary"]:hover { background: var(--blue-hi); color: var(--void);
+        box-shadow: 0 0 0 1px var(--blue), 0 0 12px rgba(14,165,233,.25); }
+    .stButton > button[kind="secondary"] { background: var(--raised); border: 1px solid var(--line); color: var(--text); }
+    .stButton > button[kind="secondary"]:hover { border-color: var(--line-strong); color: var(--blue-hi); }
+    [data-testid="stExpander"] details { background: transparent; border: 1px solid var(--line); border-radius: 10px; }
+    [data-testid="stExpander"] summary p { font-size: 13px; font-weight: 600; }
+    [data-testid="stSidebar"] hr { border-color: var(--line); margin: .9rem 0; }
+
+    /* shared atoms */
+    .rc-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+        color: var(--muted); display: flex; align-items: center; gap: .45rem; }
+    .rc-count { background: var(--raised); color: var(--text-2); border-radius: 4px; padding: 0 .35rem; }
+    .rc-chip { font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+        border: 1px solid var(--line-strong); color: var(--text-2); background: var(--raised);
+        border-radius: 4px; padding: .2rem .5rem; display: inline-flex; align-items: center; gap: .35rem; white-space: nowrap; }
+    .rc-chip.green { border-color: rgba(16,185,129,.4); background: rgba(16,185,129,.08); color: var(--green-hi); }
+    .rc-chip.blue { border-color: rgba(14,165,233,.4); background: rgba(14,165,233,.08); color: var(--blue-hi); }
+    .rc-chip.amber { border-color: rgba(245,158,11,.4); background: rgba(245,158,11,.08); color: var(--amber-hi); }
+    .rc-chip.red { border-color: rgba(239,68,68,.4); background: rgba(239,68,68,.08); color: var(--red-hi); }
+    .rc-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; display: inline-block; }
+    .rc-chip.green .rc-dot { animation: rc-pulse 2s ease-in-out infinite; }
+    @keyframes rc-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+    /* sidebar brand + channel list */
+    .rc-brand { display: flex; gap: .7rem; align-items: center; padding: .4rem 0 .2rem; }
+    .rc-brand-name { font-size: 13px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--text); }
+    .rc-brand-tag { font-size: 12px; color: var(--muted); }
+    .rc-brand-chip { margin-top: .7rem; }
+    .st-key-channels, .st-key-channels [data-testid="stVerticalBlock"] { gap: 0; }
+    .st-key-channels [data-testid="stMarkdownContainer"] { margin-bottom: 0; }
+    .st-key-channels .stButton > button { justify-content: flex-start; background: transparent; border: 0;
+        border-left: 2px solid transparent; border-radius: 6px; color: var(--text-2); font-weight: 500;
+        min-height: 34px; padding: .3rem .6rem; }
+    .st-key-channels .stButton > button > div { justify-content: flex-start; width: 100%; }
+    .st-key-channels .stButton > button:hover { background: var(--raised); color: var(--text); }
+    .st-key-channels .stButton > button[kind="primary"] { background: var(--raised); color: var(--text);
+        border-left-color: var(--blue); box-shadow: none; }
+    .st-key-channels .stButton > button p { font-family: var(--mono); font-size: 13px; }
+    .rc-preview { display: flex; justify-content: space-between; gap: .5rem; padding: .05rem .6rem .7rem 2.05rem;
+        font-size: 12px; color: var(--muted); }
+    .rc-preview span:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .rc-unread { background: var(--blue); color: var(--void); font-family: var(--mono); font-size: 10px;
+        font-weight: 700; border-radius: 9px; padding: 0 .4rem; line-height: 16px; height: 16px; }
+
+    /* chat header */
+    .rc-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; flex-wrap: wrap; }
+    .rc-title { font-size: 26px; font-weight: 600; letter-spacing: -.02em; line-height: 1.15; color: var(--text); }
+    .rc-subtitle { font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin-top: .2rem; }
+    .rc-header-chips { display: flex; gap: .45rem; flex-wrap: wrap; justify-content: flex-end; padding-top: .3rem; }
+    .rc-strip { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); margin: .9rem 0 0;
+        background: var(--base); border: 1px solid var(--line); border-radius: 10px; }
+    .rc-strip > div { padding: .6rem .8rem; border-right: 1px solid var(--line); min-width: 0; }
+    .rc-strip > div:last-child { border-right: 0; }
+    .rc-strip b { display: block; font-family: var(--mono); font-size: 9.5px; font-weight: 500; letter-spacing: .1em;
+        text-transform: uppercase; color: var(--muted); margin-bottom: .15rem; }
+    .rc-strip span { font-family: var(--mono); font-size: 12px; color: var(--text); white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; display: block; }
+    .rc-strip .ok { color: var(--green-hi); }
+
+    /* message pane */
+    .rc-pane { background: var(--base); border: 1px solid var(--line); border-radius: 10px; margin-top: .9rem;
+        height: calc(100vh - 480px); min-height: 260px; overflow-y: auto; display: flex; flex-direction: column-reverse;
+        padding: .5rem 1.6rem 1.2rem; }
+    .rc-pane-inner { display: flex; flex-direction: column; gap: 1.1rem; }
+    .rc-divider { display: flex; align-items: center; gap: 1rem; font-family: var(--mono); font-size: 10.5px;
+        letter-spacing: .14em; color: var(--muted); text-transform: uppercase; margin: 1rem 0 .2rem; }
+    .rc-divider::before, .rc-divider::after { content: ""; flex: 1; border-top: 1px solid var(--line-strong); }
+    .rc-msg-head { display: flex; align-items: baseline; gap: .6rem; font-family: var(--mono); font-size: 11px;
+        color: var(--muted); margin-bottom: .35rem; }
+    .rc-msg-head .who { font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--text); font-size: 11.5px; }
+    .rc-msg.out .rc-msg-head .who { color: var(--blue-hi); }
+    .rc-msg-head .time { color: var(--text-2); }
+    .rc-msg-body { background: var(--raised); border: 1px solid var(--line); border-left: 2px solid var(--line-strong);
+        border-radius: 6px; padding: .7rem .9rem; font-size: 15px; line-height: 1.5; color: var(--text);
+        white-space: pre-wrap; overflow-wrap: anywhere; max-width: 860px; }
+    .rc-msg.out .rc-msg-body { border-left-color: var(--blue); }
+    .rc-msg.in .rc-msg-body { border-left-color: var(--green); }
+    .rc-msg.bc .rc-msg-body { border-left-color: var(--amber); }
+    .rc-msg-meta { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; margin-top: .4rem;
+        font-family: var(--mono); font-size: 11px; color: var(--muted); }
+    .rc-msg-meta .ok { color: var(--green-hi); display: inline-flex; align-items: center; gap: .3rem; }
+    .rc-msg-meta .sep { color: var(--line-strong); }
+    .rc-empty { margin: auto; text-align: center; color: var(--text-2); max-width: 420px; padding: 2rem 1rem; }
+    .rc-empty .icon { width: 44px; height: 44px; border-radius: 10px; margin: 0 auto .9rem; display: grid; place-items: center;
+        background: var(--raised); border: 1px solid var(--line-strong); color: var(--text-2); }
+    .rc-empty .icon svg { width: 20px; height: 20px; }
+    .rc-empty-title { font-size: 17px; font-weight: 600; color: var(--text); margin: 0 0 .35rem; }
+    .rc-empty p { font-size: 13.5px; line-height: 1.55; margin: 0; }
+    .rc-empty .err { margin-top: .9rem; font-family: var(--mono); font-size: 11.5px; color: var(--red-hi); }
+
+    /* offline / handshake card */
+    .st-key-offline { background: var(--base); border: 1px solid var(--line); margin-top: .9rem;
+        border-radius: 10px; padding: 3rem 1rem 3.2rem; }
+    .st-key-offline .rc-empty { padding: 0; margin: 0 auto; }
+    .st-key-connect-main { margin: 1.2rem auto 0; }
+    .st-key-connect-main button { min-width: 260px; }
+
+    /* composer */
+    .rc-composer-head { display: flex; justify-content: space-between; align-items: center; margin: 1rem 0 .45rem;
+        font-family: var(--mono); font-size: 11px; color: var(--muted); }
+    .rc-composer-head .to { letter-spacing: .1em; text-transform: uppercase; color: var(--text-2); font-weight: 600; }
+    .rc-kbd { border: 1px solid var(--line-strong); background: var(--raised); border-radius: 4px; padding: 0 .35rem; color: var(--text-2); }
+    [data-testid="stChatInput"] { background: var(--void); border: 1px solid var(--line-strong); border-radius: 10px; }
+    [data-testid="stChatInput"]:focus-within { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue); }
+    [data-testid="stChatInput"] textarea { font-size: 14.5px; color: var(--text); }
+    [data-testid="stChatInputSubmitButton"] { color: var(--blue-hi); }
+    .rc-footer { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin: .55rem 0 .9rem;
+        font-family: var(--mono); font-size: 11px; color: var(--muted); }
+    .rc-footer .note { display: inline-flex; align-items: center; gap: .4rem; color: var(--text-2); font-family: var(--sans); font-size: 12.5px; }
+    .rc-footer .note svg { color: var(--green-hi); }
+    .rc-footer .stats { display: flex; gap: .9rem; }
+    .rc-footer .stats b { color: var(--text-2); font-weight: 500; }
+
+    /* session log */
+    .rc-log { font-family: var(--mono); font-size: 11.5px; line-height: 1.5; }
+    .rc-log div { display: grid; grid-template-columns: 70px 92px 1fr; gap: .6rem; padding: .25rem 0; border-bottom: 1px solid var(--line); }
+    .rc-log div:last-child { border-bottom: 0; }
+    .rc-log .t { color: var(--muted); }
+    .rc-log .k { text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); }
+    .rc-log .k.error { color: var(--red-hi); } .rc-log .k.assigned, .rc-log .k.connected { color: var(--green-hi); }
+    .rc-log .k.disconnected { color: var(--amber-hi); }
+    .rc-log .d { color: var(--text); overflow-wrap: anywhere; }
+
+    @media (max-width: 900px) {
+        [data-testid="stMainBlockContainer"] { padding: 1rem 1rem 1.5rem; }
+        .rc-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .rc-strip > div:nth-child(3) { border-right: 0; }
+        .rc-strip > div:nth-child(-n+3) { border-bottom: 1px solid var(--line); }
+        .rc-pane { padding: .5rem .9rem 1rem; }
+    }
+    </style>""")
+
+
+def show(markup: str) -> None:
+    """Render trusted UI markup; every user-supplied value is escaped before it gets here."""
+    st.markdown(markup, unsafe_allow_html=True)
+
+
+def message_html(message: dict) -> str:
+    outgoing = message["direction"] == "sent"
+    classes = "rc-msg " + ("out" if outgoing else "in") + (" bc" if message["target_id"] == 0 else "")
+    who = "You" if outgoing else f"Client #{message['sender_id']}"
+    when = time.strftime("%H:%M:%S", time.localtime(message["when"]))
+    tag = "TX_OUT" if outgoing else "RX_IN"
+    broadcast = '<span class="rc-chip amber">Broadcast</span>' if message["target_id"] == 0 and outgoing else ""
+    if outgoing:
+        status = f'<span class="ok">{LOCK_SVG}Encrypted</span><span class="sep">·</span><span>Sent to relay</span>'
+    else:
+        status = f'<span class="ok">{CHECK_SVG}Decrypted</span><span class="sep">·</span><span>MAC verified</span>'
+    body = html.escape(message["text"]).replace("\n", "<br>")
+    return (
+        f'<div class="{classes}">'
+        f'<div class="rc-msg-head"><span class="who">{html.escape(who)}</span><span class="time">{when}</span>'
+        f'<span>{tag}</span>{broadcast}</div>'
+        f'<div class="rc-msg-body">{body}</div>'
+        f'<div class="rc-msg-meta">{status}<span class="sep">·</span><span>{message["bytes"]} B frame</span>'
+        f'<span class="sep">·</span><span>Seq #{message["sequence"]}</span></div>'
+        f'</div>'
+    )
+
+
+def empty_html(icon: str, title: str, body: str, error: str | None = None) -> str:
+    error_html = f'<div class="err">{html.escape(error)}</div>' if error else ""
+    return (
+        f'<div class="rc-empty"><div class="icon">{icon}</div><div class="rc-empty-title">{html.escape(title)}</div>'
+        f'<p>{html.escape(body)}</p>{error_html}</div>'
+    )
+
+
+def relay_address() -> str:
+    host = st.session_state.get("host", st.session_state.get("cfg_host", DEFAULT_SERVER_HOST))
+    port = st.session_state.get("port", st.session_state.get("cfg_port", DEFAULT_SERVER_PORT))
+    return f"{host}:{port}"
+
+
+def connect_from_settings(relay: RelayConnection) -> None:
+    host = st.session_state.cfg_host.strip()
+    port = int(st.session_state.cfg_port)
+    key_path = st.session_state.cfg_key_path
+    try:
+        relay.connect(host, port, load_key(key_path))
+        st.session_state.update(host=host, port=port, key_path=key_path)
+        st.session_state.connect_error = None
+    except (OSError, ValueError, ConnectionError) as exc:
+        st.session_state.connect_error = f"Could not connect to {host}:{port}: {exc}"
 
 
 @st.fragment(run_every=2)
@@ -299,47 +537,68 @@ def render_live_chat(relay: RelayConnection) -> None:
     relay.drain_events()
     state = relay.snapshot()
     target = st.session_state.active_target
-    chat_name = "Broadcast" if target == 0 else f"Client #{target}"
-    presence = "Connected" if state["connected"] else "Disconnected"
-    client_label = f"#{state['client_id']}" if state["client_id"] is not None else "awaiting assignment"
-    st.markdown(f'<div class="topbar"><div class="topbar-name">{chat_name}</div><div class="topbar-meta">{presence} · encrypted relay · your client ID: {client_label}</div></div>', unsafe_allow_html=True)
+    name = chat_name(target)
+    conversation = conversation_for(relay.messages, target, state["client_id"])
+    st.session_state.seen[target] = received_count(conversation)
 
-    conversation = []
-    for message in relay.messages:
-        if message["direction"] == "sent" and message["target_id"] == target:
-            conversation.append(message)
-        elif message["direction"] == "received":
-            is_broadcast = target == 0 and message["target_id"] == 0
-            is_direct_to_this_client = (
-                target != 0
-                and message["sender_id"] == target
-                and message["target_id"] == state["client_id"]
-            )
-            if is_broadcast or is_direct_to_this_client:
-                conversation.append(message)
-    if not conversation:
-        empty = "No broadcast messages yet." if target == 0 else f"No messages with Client #{target} yet."
-        st.markdown(f'<div class="empty-chat">{empty}<br><br>Messages are encrypted locally before they reach the relay.</div>', unsafe_allow_html=True)
-    for message in conversation:
-        outgoing = message["direction"] == "sent"
-        direction = "outgoing" if outgoing else "incoming"
-        broadcast = " broadcast" if message["target_id"] == 0 else ""
-        label = "You" if outgoing else f"Client #{message['sender_id']}"
-        timestamp = time.strftime("%H:%M", time.localtime(message["when"]))
-        safe_text = html.escape(message["text"]).replace("\n", "<br>")
-        st.markdown(
-            f'<div class="message-row {direction}"><div class="message-bubble {direction}{broadcast}">'
-            f'{safe_text}<div class="message-meta">{label} · {timestamp} · ✓ encrypted</div>'
-            f'</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    if not state["connected"]:
-        st.info("Connect to the relay from Connection settings to send messages.")
-    elif state["client_id"] is None:
-        st.info("Waiting for the relay to assign this browser session a client ID.")
+    if state["connected"] and state["client_id"] is not None:
+        presence = '<span class="rc-chip green"><span class="rc-dot"></span>Online</span>'
+    elif state["connected"]:
+        presence = '<span class="rc-chip amber"><span class="rc-dot"></span>Handshaking</span>'
     else:
-        text = st.chat_input(f"Message {chat_name}")
+        presence = '<span class="rc-chip red"><span class="rc-dot"></span>Offline</span>'
+    you = f"You: Client #{state['client_id']}" if state["connected"] and state["client_id"] is not None else "You: unassigned"
+    subtitle = "All connected peers" if target == 0 else "Direct, end-to-end encrypted"
+    show(
+        f'<div class="rc-header"><div><div class="rc-title">{name}</div>'
+        f'<div class="rc-subtitle">{subtitle} · relay {html.escape(relay_address())}</div></div>'
+        f'<div class="rc-header-chips">{presence}<span class="rc-chip blue">{html.escape(you)}</span>'
+        f'<span class="rc-chip">{LOCK_SVG}XChaCha20-Poly1305</span></div></div>'
+        f'<div class="rc-strip">'
+        f'<div><b>Cipher</b><span>XChaCha20-Poly1305-IETF</span></div>'
+        f'<div><b>MAC</b><span>Poly1305 · {CRYPTO_MAC_SIZE} B</span></div>'
+        f'<div><b>Nonce</b><span>{CRYPTO_NONCE_SIZE} B random</span></div>'
+        f'<div><b>Key</b><span class="ok">{CRYPTO_KEY_SIZE * 8}-bit shared</span></div>'
+        f'<div><b>Next seq</b><span>{"#" + str(relay.next_sequence) if state["connected"] else "—"}</span></div>'
+        f'<div><b>Uptime</b><span>{uptime(state["connected_at"]) if state["connected"] else "—"}</span></div>'
+        f'</div>'
+    )
+
+    if not state["connected"] or state["client_id"] is None:
+        with st.container(key="offline"):
+            if not state["connected"]:
+                error = last_error(relay) or st.session_state.get("connect_error")
+                show(empty_html(
+                    SHIELD_SVG, "Relay offline",
+                    f"Connect to the relay at {relay_address()} to start an encrypted session. "
+                    "Messages are encrypted on this device before they leave it.",
+                    error,
+                ))
+                if st.button(f"Connect to {relay_address()}", type="primary", key="connect-main"):
+                    connect_from_settings(relay)
+                    st.rerun()
+            else:
+                show(empty_html(
+                    SHIELD_SVG, "Handshaking with the relay",
+                    "Connected. Waiting for the relay to assign this browser session a client ID.",
+                ))
+    else:
+        if conversation:
+            items = '<div class="rc-divider">Secure session established</div>'
+            items += "".join(message_html(message) for message in conversation)
+        else:
+            body = (
+                "Broadcasts reach every client connected to the relay."
+                if target == 0 else f"Messages you send to Client #{target} are readable only by them."
+            )
+            items = empty_html(LOCK_SVG, f"No messages with {name} yet" if target else "No broadcasts yet", body)
+        show(f'<div class="rc-pane"><div class="rc-pane-inner">{items}</div></div>')
+
+        show(
+            f'<div class="rc-composer-head"><span class="to">To: {name}</span>'
+            f'<span>Press <span class="rc-kbd">Enter</span> to send</span></div>'
+        )
+        text = st.chat_input(f"Write an encrypted message to {name}…", max_chars=PROTOCOL_MAX_PAYLOAD)
         if text:
             try:
                 relay.send_message(target, text)
@@ -347,63 +606,104 @@ def render_live_chat(relay: RelayConnection) -> None:
                 st.rerun(scope="fragment")
             except (ValueError, RuntimeError, ConnectionError, OSError) as exc:
                 st.error(str(exc))
+
     total_bytes = fmt_bytes(state["bytes_sent"] + state["bytes_received"])
-    st.markdown(f'<div class="session-note">Live updates every 2 seconds · this browser session: {state["sent"]} sent · {state["received"]} received · {total_bytes} encrypted frame traffic · uptime {uptime(state["connected_at"])}</div>', unsafe_allow_html=True)
+    show(
+        f'<div class="rc-footer"><span class="note">{SHIELD_SVG}Payloads are encrypted locally. '
+        f'The relay never sees plaintext.</span>'
+        f'<span class="stats"><span>TX <b>{state["sent"]}</b></span><span>RX <b>{state["received"]}</b></span>'
+        f'<span>Traffic <b>{total_bytes}</b></span><span>Live · 2s</span></span></div>'
+    )
+
+    with st.expander(f"Session log · {len(relay.activity)} events"):
+        if relay.activity:
+            rows = "".join(
+                f'<div><span class="t">{time.strftime("%H:%M:%S", time.localtime(event.when))}</span>'
+                f'<span class="k {html.escape(event.kind)}">{html.escape(event.kind)}</span>'
+                f'<span class="d">{html.escape(event.detail)}</span></div>'
+                for event in reversed(relay.activity[-40:])
+            )
+            show(f'<div class="rc-log">{rows}</div>')
+        else:
+            st.caption("No session events yet.")
+
+
+@st.fragment(run_every=2)
+def render_channels(relay: RelayConnection) -> None:
+    """Live channel list: broadcast plus every peer this session has heard from."""
+    relay.drain_events()
+    state = relay.snapshot()
+    active = st.session_state.active_target
+    targets = [0] + state["peers"]
+    if active not in targets:
+        targets.append(active)
+    show(f'<div class="rc-label">Channels <span class="rc-count">{len(targets)}</span></div>')
+    with st.container(key="channels"):
+        for target in targets:
+            icon = ":material/cell_tower:" if target == 0 else ":material/person:"
+            if st.button(
+                chat_name(target), key=f"channel-{target}", icon=icon, use_container_width=True,
+                type="primary" if target == active else "secondary",
+            ):
+                st.session_state.active_target = target
+                st.rerun()
+            conversation = conversation_for(relay.messages, target, state["client_id"])
+            unread = 0 if target == active else max(0, received_count(conversation) - st.session_state.seen.get(target, 0))
+            badge = f'<span class="rc-unread">{unread}</span>' if unread else ""
+            show(
+                f'<div class="rc-preview"><span>{html.escape(conversation_preview(conversation))}</span>{badge}</div>'
+            )
 
 
 def main() -> None:
-    st.set_page_config(page_title="Relay Chat", page_icon="💬", layout="wide")
+    st.set_page_config(page_title="Relay Chat", page_icon="🔐", layout="wide")
     style()
     relay = connection()
     relay.drain_events()
     state = relay.snapshot()
-    if "active_target" not in st.session_state:
-        st.session_state.active_target = 0
+    st.session_state.setdefault("active_target", 0)
+    st.session_state.setdefault("seen", {})
+    st.session_state.setdefault("cfg_host", st.session_state.get("host", DEFAULT_SERVER_HOST))
+    st.session_state.setdefault("cfg_port", int(st.session_state.get("port", DEFAULT_SERVER_PORT)))
+    st.session_state.setdefault("cfg_key_path", st.session_state.get("key_path", str(DEFAULT_KEY_PATH)))
+
     with st.sidebar:
-        st.markdown('<div class="chat-title">Relay Chat</div><div class="chat-subtitle">Encrypted, blind-relay messaging</div>', unsafe_allow_html=True)
+        show(
+            f'<div class="rc-brand">{LOGO_SVG}<div><div class="rc-brand-name">Relay Chat</div>'
+            f'<div class="rc-brand-tag">Route securely. Reveal nothing.</div></div></div>'
+            f'<div class="rc-brand-chip"><span class="rc-chip">{LOCK_SVG}Blind encrypted relay</span></div>'
+        )
         st.divider()
-        if state["connected"]:
-            st.success(f"Connected · You are #{state['client_id'] if state['client_id'] is not None else '…'}")
-        else:
-            st.warning("Relay disconnected")
-        if st.button("↻  Refresh messages", use_container_width=True):
-            relay.drain_events()
+        render_channels(relay)
+
+        show('<div class="rc-label" style="margin-top:.6rem">New direct chat</div>')
+        id_col, open_col = st.columns([3, 2], vertical_alignment="bottom")
+        new_target = id_col.number_input(
+            "Client ID", min_value=1, max_value=0xFFFFFFFF, value=1, step=1, label_visibility="collapsed"
+        )
+        if open_col.button("Open", use_container_width=True):
+            st.session_state.active_target = int(new_target)
             st.rerun()
-        st.caption("Incoming messages update automatically every 2 seconds.")
-        st.subheader("Chats")
-        if st.button("📣  Broadcast", use_container_width=True, type="primary" if st.session_state.active_target == 0 else "secondary"):
-            st.session_state.active_target = 0
-            st.rerun()
-        st.markdown(f'<div class="conversation-preview">{html.escape(conversation_preview(relay.messages, 0, state["client_id"]))}</div>', unsafe_allow_html=True)
-        for peer in state["peers"]:
-            if st.button(f"👤  Client #{peer}", key=f"peer-{peer}", use_container_width=True, type="primary" if st.session_state.active_target == peer else "secondary"):
-                st.session_state.active_target = peer
-                st.rerun()
-            preview = conversation_preview(relay.messages, peer, state["client_id"])
-            st.markdown(f'<div class="conversation-preview">{html.escape(preview)}</div>', unsafe_allow_html=True)
-        with st.expander("Start a direct chat"):
-            new_target = st.number_input("Client ID", min_value=1, max_value=0xFFFFFFFF, value=1, step=1, label_visibility="collapsed")
-            if st.button("Open chat", use_container_width=True):
-                st.session_state.active_target = int(new_target)
-                st.rerun()
         st.divider()
-        with st.expander("Connection settings"):
-            host = st.text_input("Relay host", value=st.session_state.get("host", DEFAULT_SERVER_HOST))
-            port = st.number_input("TCP port", min_value=1, max_value=65535, value=int(st.session_state.get("port", DEFAULT_SERVER_PORT)), step=1)
-            key_path = st.text_input("Shared key path", value=st.session_state.get("key_path", str(DEFAULT_KEY_PATH)))
-            if st.button("Connect to relay", use_container_width=True):
-                try:
-                    relay.connect(host.strip(), int(port), load_key(key_path))
-                    st.session_state.update(host=host.strip(), port=int(port), key_path=key_path)
+
+        with st.expander("Connection", icon=":material/lan:", expanded=not state["connected"]):
+            st.text_input("Relay host", key="cfg_host")
+            st.number_input("TCP port", min_value=1, max_value=65535, step=1, key="cfg_port")
+            st.text_input("Shared key path", key="cfg_key_path")
+            if state["connected"]:
+                if st.button("Disconnect", use_container_width=True):
+                    relay.disconnect()
+                    relay.drain_events()
                     st.rerun()
-                except (OSError, ValueError, ConnectionError) as exc:
-                    st.error(f"Could not connect: {exc}")
-            if state["connected"] and st.button("Disconnect", use_container_width=True):
-                relay.disconnect()
-                relay.drain_events()
+            elif st.button("Connect to relay", type="primary", use_container_width=True):
+                connect_from_settings(relay)
                 st.rerun()
-        with st.expander("Security details"):
-            st.caption("XChaCha20-Poly1305-IETF · 32-byte key · 24-byte nonce · 16-byte MAC · authenticated routing metadata. The C relay validates sender IDs and strict incoming sequence numbers, and does not decrypt payloads.")
+        with st.expander("Security model", icon=":material/shield:"):
+            st.caption(
+                "XChaCha20-Poly1305-IETF · 32-byte key · 24-byte nonce · 16-byte MAC · authenticated routing "
+                "metadata. The C relay validates sender IDs and strict incoming sequence numbers, and does not "
+                "decrypt payloads."
+            )
 
     render_live_chat(relay)
 
